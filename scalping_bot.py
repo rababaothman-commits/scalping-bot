@@ -1,14 +1,10 @@
 import os
-import logging
 import requests
 requests.packages.urllib3.disable_warnings()
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 import yfinance as yf
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(_name_)
 
 TOKEN = os.environ.get("TOKEN")
 
@@ -39,22 +35,21 @@ SCALP = {
 def get_scalp_data(pair):
     try:
         symbol = PAIRS[pair]["symbol"]
-        logger.info(f"Fetching {symbol}")
+        print(f"Fetching {symbol}")
 
         tk  = yf.Ticker(symbol)
         h5  = tk.history(period="1d", interval="5m")
         h15 = tk.history(period="5d", interval="15m")
 
         if h5.empty or len(h5) < 20:
-            logger.warning(f"5m data empty for {symbol}")
+            print(f"5m data empty for {symbol}")
             return None
         if h15.empty or len(h15) < 20:
-            logger.warning(f"15m data empty for {symbol}")
+            print(f"15m data empty for {symbol}")
             return None
 
         price = round(float(h5['Close'].iloc[-1]), 5)
 
-        # ── 5M indicators ──────────────────────────────────────────
         delta5 = h5['Close'].diff()
         gain5  = delta5.where(delta5 > 0, 0).rolling(14).mean().iloc[-1]
         loss5  = -delta5.where(delta5 < 0, 0).rolling(14).mean().iloc[-1]
@@ -73,7 +68,6 @@ def get_scalp_data(pair):
         signal5  = float((ema12_5 - ema26_5).ewm(span=9, adjust=False).mean().iloc[-1])
         macd_cross5 = "🟢 صاعد" if macd5 > signal5 else "🔴 هابط"
 
-        # ── 15M indicators ─────────────────────────────────────────
         delta15 = h15['Close'].diff()
         gain15  = delta15.where(delta15 > 0, 0).rolling(14).mean().iloc[-1]
         loss15  = -delta15.where(delta15 < 0, 0).rolling(14).mean().iloc[-1]
@@ -86,13 +80,11 @@ def get_scalp_data(pair):
         high14_15 = float(h15['High'].rolling(14).max().iloc[-1])
         stoch15   = round(100 * (price - low14_15) / (high14_15 - low14_15), 1) if (high14_15 - low14_15) != 0 else 50.0
 
-        # ── Support / Resistance ───────────────────────────────────
         recent = h15.tail(20)
         res = round(float(recent['High'].max()), 5)
         sup = round(float(recent['Low'].min()), 5)
         mid = round((res + sup) / 2, 5)
 
-        # ── Signal logic ───────────────────────────────────────────
         tp_pct = SCALP[pair]["tp"]
         sl_pct = SCALP[pair]["sl"]
 
@@ -133,7 +125,7 @@ def get_scalp_data(pair):
         }
 
     except Exception as e:
-        logger.error(f"Error fetching {pair}: {e}")
+        print(f"Error fetching {pair}: {e}")
         return None
 
 
@@ -203,7 +195,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not d:
         await q.edit_message_text(
             "❌ خطأ في جلب البيانات\n"
-            "السوق مغلق أو البيانات غير متاحة الآن\n"
+            "السوق مغلق أو البيانات غير متاحة\n"
             "حاول مرة أخرى بعد قليل",
             reply_markup=back_keyboard()
         )
