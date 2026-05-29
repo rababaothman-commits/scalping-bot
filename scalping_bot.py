@@ -1,23 +1,23 @@
 import os
 import requests
-requests.packages.urllib3.disable_warnings()
+
+TOKEN = os.environ.get("TOKEN")
+TWELVE_KEY = os.environ.get("TWELVE_KEY")
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-import yfinance as yf
 
-TOKEN = os.environ.get("TOKEN")
-
+# Twelve Data symbols
 PAIRS = {
-    "GOLD":      {"symbol": "GC=F",      "name": "XAUUSD 🥇",  "ar": "الذهب"},
-    "SILVER":    {"symbol": "SI=F",      "name": "XAGUSD 🥈",  "ar": "الفضة"},
-    "NASDAQ":    {"symbol": "NQ=F",      "name": "NASDAQ 📊",  "ar": "ناسداك"},
-    "DOW_JONES": {"symbol": "YM=F",      "name": "US30 📈",    "ar": "داو جونز"},
-    "EURUSD":    {"symbol": "EURUSD=X",  "name": "EUR/USD 🇪🇺", "ar": "يورو/دولار"},
-    "USDJPY":    {"symbol": "USDJPY=X",  "name": "USD/JPY 🇯🇵", "ar": "دولار/ين"},
-    "GBPUSD":    {"symbol": "GBPUSD=X",  "name": "GBP/USD 🇬🇧", "ar": "جنيه/دولار"},
-    "BITCOIN":   {"symbol": "BTC-USD",   "name": "BITCOIN ₿",  "ar": "بيتكوين"},
-    "OIL":       {"symbol": "CL=F",      "name": "USOIL 🛢️",   "ar": "النفط"}
+    "GOLD":      {"symbol": "XAU/USD",  "name": "XAUUSD 🥇",  "ar": "الذهب"},
+    "SILVER":    {"symbol": "XAG/USD",  "name": "XAGUSD 🥈",  "ar": "الفضة"},
+    "NASDAQ":    {"symbol": "IXIC",     "name": "NASDAQ 📊",  "ar": "ناسداك"},
+    "DOW_JONES": {"symbol": "DJI",      "name": "US30 📈",    "ar": "داو جونز"},
+    "EURUSD":    {"symbol": "EUR/USD",  "name": "EUR/USD 🇪🇺", "ar": "يورو/دولار"},
+    "USDJPY":    {"symbol": "USD/JPY",  "name": "USD/JPY 🇯🇵", "ar": "دولار/ين"},
+    "GBPUSD":    {"symbol": "GBP/USD",  "name": "GBP/USD 🇬🇧", "ar": "جنيه/دولار"},
+    "BITCOIN":   {"symbol": "BTC/USD",  "name": "BITCOIN ₿",  "ar": "بيتكوين"},
+    "OIL":       {"symbol": "WTI/USD",  "name": "USOIL 🛢️",   "ar": "النفط"}
 }
 
 SCALP = {
@@ -32,96 +32,120 @@ SCALP = {
     "OIL":       {"tp": 0.0020, "sl": 0.0012},
 }
 
+
+def ema(values, span):
+    k = 2 / (span + 1)
+    e = values[0]
+    for v in values[1:]:
+        e = v * k + e * (1 - k)
+    return e
+
+
+def rsi(closes, period=14):
+    if len(closes) < period + 1:
+        return 50.0
+    gains, losses = [], []
+    for i in range(1, len(closes)):
+        d = closes[i] - closes[i - 1]
+        gains.append(max(d, 0))
+        losses.append(max(-d, 0))
+    avg_gain = sum(gains[-period:]) / period
+    avg_loss = sum(losses[-period:]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return round(100 - (100 / (1 + rs)), 1)
+
+
+def fetch_series(symbol, interval):
+    """Fetch candles from Twelve Data. Returns lists of close/high/low, newest last."""
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": 50,
+        "apikey": TWELVE_KEY,
+    }
+    r = requests.get(url, params=params, timeout=30)
+    data = r.json()
+    if data.get("status") == "error" or "values" not in data:
+        print(f"TwelveData error for {symbol} {interval}: {data}")
+        return None
+    vals = list(reversed(data["values"]))  # API returns newest first
+    closes = [float(v["close"]) for v in vals]
+    highs  = [float(v["high"])  for v in vals]
+    lows   = [float(v["low"])   for v in vals]
+    return {"close": closes, "high": highs, "low": lows}
+
+
 def get_scalp_data(pair):
     try:
         symbol = PAIRS[pair]["symbol"]
         print(f"Fetching {symbol}")
 
-        tk  = yf.Ticker(symbol)
-        h5  = tk.history(period="1d", interval="5m")
-        h15 = tk.history(period="5d", interval="15m")
+        s5  = fetch_series(symbol, "5min")
+        s15 = fetch_series(symbol, "15min")
 
-        if h5.empty or len(h5) < 20:
+        if not s5 or len(s5["close"]) < 20:
             print(f"5m data empty for {symbol}")
             return None
-        if h15.empty or len(h15) < 20:
+        if not s15 or len(s15["close"]) < 20:
             print(f"15m data empty for {symbol}")
             return None
 
-        price = round(float(h5['Close'].iloc[-1]), 5)
+        price = round(s5["close"][-1], 5)
 
-        delta5 = h5['Close'].diff()
-        gain5  = delta5.where(delta5 > 0, 0).rolling(14).mean().iloc[-1]
-        loss5  = -delta5.where(delta5 < 0, 0).rolling(14).mean().iloc[-1]
-        rsi5   = round(100 - (100 / (1 + gain5 / loss5)), 1) if loss5 and loss5 != 0 else 100.0
+        # 5M indicators
+        rsi5 = rsi(s5["close"])
+        ema9_5  = ema(s5["close"][-30:], 9)
+        ema21_5 = ema(s5["close"][-30:], 21)
+        low14_5  = min(s5["low"][-14:])
+        high14_5 = max(s5["high"][-14:])
+        stoch5 = round(100 * (price - low14_5) / (high14_5 - low14_5), 1) if (high14_5 - low14_5) != 0 else 50.0
+        ema12_5 = ema(s5["close"], 12)
+        ema26_5 = ema(s5["close"], 26)
+        macd5 = ema12_5 - ema26_5
+        macd_cross5 = "🟢 صاعد" if macd5 > 0 else "🔴 هابط"
 
-        ema9_5  = float(h5['Close'].ewm(span=9,  adjust=False).mean().iloc[-1])
-        ema21_5 = float(h5['Close'].ewm(span=21, adjust=False).mean().iloc[-1])
+        # 15M indicators
+        rsi15 = rsi(s15["close"])
+        ema9_15  = ema(s15["close"][-30:], 9)
+        ema21_15 = ema(s15["close"][-30:], 21)
+        low14_15  = min(s15["low"][-14:])
+        high14_15 = max(s15["high"][-14:])
+        stoch15 = round(100 * (price - low14_15) / (high14_15 - low14_15), 1) if (high14_15 - low14_15) != 0 else 50.0
 
-        low14_5  = float(h5['Low'].rolling(14).min().iloc[-1])
-        high14_5 = float(h5['High'].rolling(14).max().iloc[-1])
-        stoch5   = round(100 * (price - low14_5) / (high14_5 - low14_5), 1) if (high14_5 - low14_5) != 0 else 50.0
-
-        ema12_5  = h5['Close'].ewm(span=12, adjust=False).mean()
-        ema26_5  = h5['Close'].ewm(span=26, adjust=False).mean()
-        macd5    = float((ema12_5 - ema26_5).iloc[-1])
-        signal5  = float((ema12_5 - ema26_5).ewm(span=9, adjust=False).mean().iloc[-1])
-        macd_cross5 = "🟢 صاعد" if macd5 > signal5 else "🔴 هابط"
-
-        delta15 = h15['Close'].diff()
-        gain15  = delta15.where(delta15 > 0, 0).rolling(14).mean().iloc[-1]
-        loss15  = -delta15.where(delta15 < 0, 0).rolling(14).mean().iloc[-1]
-        rsi15   = round(100 - (100 / (1 + gain15 / loss15)), 1) if loss15 and loss15 != 0 else 100.0
-
-        ema9_15  = float(h15['Close'].ewm(span=9,  adjust=False).mean().iloc[-1])
-        ema21_15 = float(h15['Close'].ewm(span=21, adjust=False).mean().iloc[-1])
-
-        low14_15  = float(h15['Low'].rolling(14).min().iloc[-1])
-        high14_15 = float(h15['High'].rolling(14).max().iloc[-1])
-        stoch15   = round(100 * (price - low14_15) / (high14_15 - low14_15), 1) if (high14_15 - low14_15) != 0 else 50.0
-
-        recent = h15.tail(20)
-        res = round(float(recent['High'].max()), 5)
-        sup = round(float(recent['Low'].min()), 5)
+        # S/R from last 20 of 15M
+        res = round(max(s15["high"][-20:]), 5)
+        sup = round(min(s15["low"][-20:]), 5)
         mid = round((res + sup) / 2, 5)
 
         tp_pct = SCALP[pair]["tp"]
         sl_pct = SCALP[pair]["sl"]
 
-        buy_score  = sum([rsi5 < 35, rsi15 < 40, stoch5 < 25, price > ema9_15, macd5 > signal5])
-        sell_score = sum([rsi5 > 65, rsi15 > 60, stoch5 > 75, price < ema9_15, macd5 < signal5])
+        buy_score  = sum([rsi5 < 35, rsi15 < 40, stoch5 < 25, price > ema9_15, macd5 > 0])
+        sell_score = sum([rsi5 > 65, rsi15 > 60, stoch5 > 75, price < ema9_15, macd5 < 0])
 
         if buy_score >= 3:
-            sig      = "🟢 شراء سكالبينج"
-            entry    = price
-            tp       = round(price * (1 + tp_pct), 5)
-            sl       = round(price * (1 - sl_pct), 5)
+            sig = "🟢 شراء سكالبينج"; entry = price
+            tp = round(price * (1 + tp_pct), 5); sl = round(price * (1 - sl_pct), 5)
             strength = "⭐" * buy_score
         elif sell_score >= 3:
-            sig      = "🔴 بيع سكالبينج"
-            entry    = price
-            tp       = round(price * (1 - tp_pct), 5)
-            sl       = round(price * (1 + sl_pct), 5)
+            sig = "🔴 بيع سكالبينج"; entry = price
+            tp = round(price * (1 - tp_pct), 5); sl = round(price * (1 + sl_pct), 5)
             strength = "⭐" * sell_score
         else:
-            sig      = "⏸️ انتظار إشارة"
-            entry    = None
-            tp       = None
-            sl       = None
-            strength = ""
+            sig = "⏸️ انتظار إشارة"; entry = None; tp = None; sl = None; strength = ""
 
         trend5  = "🔼 صاعد" if ema9_5  > ema21_5  else "🔽 هابط"
         trend15 = "🔼 صاعد" if ema9_15 > ema21_15 else "🔽 هابط"
 
         return {
-            "price": price,
-            "rsi5": rsi5,     "rsi15": rsi15,
-            "stoch5": stoch5, "stoch15": stoch15,
-            "macd_cross5": macd_cross5,
+            "price": price, "rsi5": rsi5, "rsi15": rsi15,
+            "stoch5": stoch5, "stoch15": stoch15, "macd_cross5": macd_cross5,
             "trend5": trend5, "trend15": trend15,
             "res": res, "sup": sup, "mid": mid,
-            "sig": sig, "entry": entry, "tp": tp, "sl": sl,
-            "strength": strength
+            "sig": sig, "entry": entry, "tp": tp, "sl": sl, "strength": strength
         }
 
     except Exception as e:
