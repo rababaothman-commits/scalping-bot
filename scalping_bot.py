@@ -1,268 +1,274 @@
+"""
+Smart Market Explorer Bot - مستكشف الأسواق الذكي
+===================================================
+الأصول: XAUUSD, BTCUSD, NAS100, EURUSD, GBPJPY
+المنهجية: SMC (Smart Money Concepts)
+مزود البيانات: Twelve Data (twelvedata.com)
+"""
+
 import os
+import logging
+import asyncio
 import requests
+from datetime import datetime
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-TOKEN = os.environ.get("TOKEN")
-TWELVE_KEY = os.environ.get("TWELVE_KEY")
+# ─────────────────────────────────────────────
+# الإعدادات العامة
+# ─────────────────────────────────────────────
+TELEGRAM_TOKEN  = os.getenv("TELEGRAM_TOKEN", "YOUR_TOKEN_HERE")
+CHAT_ID         = os.getenv("CHAT_ID", "YOUR_CHAT_ID_HERE")
+TWELVE_KEY      = os.getenv("TWELVE_KEY", "YOUR_TWELVEDATA_KEY_HERE")
+ACCOUNT_BALANCE = float(os.getenv("ACCOUNT_BALANCE", "10000"))
+RISK_PERCENT    = 0.01          # ريسك 1% لكل صفقة
+SCAN_INTERVAL   = int(os.getenv("SCAN_INTERVAL", "300"))   # فحص كل 5 دقائق
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+TWELVE_BASE = "https://api.twelvedata.com"
 
-# Twelve Data symbols
-PAIRS = {
-    "GOLD":      {"symbol": "XAU/USD",  "name": "XAUUSD 🥇",  "ar": "الذهب"},
-    "SILVER":    {"symbol": "XAG/USD",  "name": "XAGUSD 🥈",  "ar": "الفضة"},
-    "NASDAQ":    {"symbol": "IXIC",     "name": "NASDAQ 📊",  "ar": "ناسداك"},
-    "DOW_JONES": {"symbol": "DJI",      "name": "US30 📈",    "ar": "داو جونز"},
-    "EURUSD":    {"symbol": "EUR/USD",  "name": "EUR/USD 🇪🇺", "ar": "يورو/دولار"},
-    "USDJPY":    {"symbol": "USD/JPY",  "name": "USD/JPY 🇯🇵", "ar": "دولار/ين"},
-    "GBPUSD":    {"symbol": "GBP/USD",  "name": "GBP/USD 🇬🇧", "ar": "جنيه/دولار"},
-    "BITCOIN":   {"symbol": "BTC/USD",  "name": "BITCOIN ₿",  "ar": "بيتكوين"},
-    "OIL":       {"symbol": "WTI/USD",  "name": "USOIL 🛢️",   "ar": "النفط"}
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────────
+# رموز الأصول ومعاملاتها
+# رمز Twelve Data مختلف قليلاً لبعض الأصول
+# ─────────────────────────────────────────────
+ASSETS = {
+    "XAU/USD": {
+        "display": "XAUUSD",
+        "name": "الذهب / دولار",
+        "pip_value": 1.0,        # $1 لكل نقطة لكل لوت قياسي (100oz)
+        "min_lot": 0.01,
+        "lot_digits": 2,
+    },
+    "BTC/USD": {
+        "display": "BTCUSD",
+        "name": "بيتكوين / دولار",
+        "pip_value": 1.0,
+        "min_lot": 0.001,
+        "lot_digits": 3,
+    },
+    "NDX": {
+        "display": "NAS100",
+        "name": "ناسداك 100",
+        "pip_value": 1.0,
+        "min_lot": 0.01,
+        "lot_digits": 2,
+    },
+    "EUR/USD": {
+        "display": "EURUSD",
+        "name": "يورو / دولار",
+        "pip_value": 10.0,       # $10 لكل نقطة (pip) لكل لوت قياسي
+        "min_lot": 0.01,
+        "lot_digits": 2,
+    },
+    "GBP/JPY": {
+        "display": "GBPJPY",
+        "name": "جنيه / ين",
+        "pip_value": 0.07,       # تقريبي ويتغير مع USDJPY
+        "min_lot": 0.01,
+        "lot_digits": 2,
+    },
 }
 
-SCALP = {
-    "GOLD":      {"tp": 0.0015, "sl": 0.0010},
-    "SILVER":    {"tp": 0.0020, "sl": 0.0012},
-    "NASDAQ":    {"tp": 0.0015, "sl": 0.0010},
-    "DOW_JONES": {"tp": 0.0015, "sl": 0.0010},
-    "EURUSD":    {"tp": 0.0010, "sl": 0.0007},
-    "USDJPY":    {"tp": 0.0010, "sl": 0.0007},
-    "GBPUSD":    {"tp": 0.0010, "sl": 0.0007},
-    "BITCOIN":   {"tp": 0.0025, "sl": 0.0015},
-    "OIL":       {"tp": 0.0020, "sl": 0.0012},
-}
+# ─────────────────────────────────────────────
+# جلب البيانات من Twelve Data
+# ─────────────────────────────────────────────
 
-
-def ema(values, span):
-    k = 2 / (span + 1)
-    e = values[0]
-    for v in values[1:]:
-        e = v * k + e * (1 - k)
-    return e
-
-
-def rsi(closes, period=14):
-    if len(closes) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_gain = sum(gains[-period:]) / period
-    avg_loss = sum(losses[-period:]) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return round(100 - (100 / (1 + rs)), 1)
-
-
-def fetch_series(symbol, interval):
-    """Fetch candles from Twelve Data. Returns lists of close/high/low, newest last."""
-    url = "https://api.twelvedata.com/time_series"
+def fetch_candles(symbol: str, interval: str, limit: int = 300) -> list[dict]:
+    """
+    جلب الشمعات من Twelve Data.
+    interval: '1min' | '5min' | '15min' | '1h' | '4h'
+    يُعيد: [{time, open, high, low, close, volume}] من الأقدم للأحدث
+    """
+    url = f"{TWELVE_BASE}/time_series"
     params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": 50,
-        "apikey": TWELVE_KEY,
+        "symbol":     symbol,
+        "interval":   interval,
+        "outputsize": limit,
+        "apikey":     TWELVE_KEY,
+        "format":     "JSON",
+        "order":      "ASC",   # من الأقدم للأحدث مباشرةً
     }
-    r = requests.get(url, params=params, timeout=30)
-    data = r.json()
-    if data.get("status") == "error" or "values" not in data:
-        print(f"TwelveData error for {symbol} {interval}: {data}")
-        return None
-    vals = list(reversed(data["values"]))  # API returns newest first
-    closes = [float(v["close"]) for v in vals]
-    highs  = [float(v["high"])  for v in vals]
-    lows   = [float(v["low"])   for v in vals]
-    return {"close": closes, "high": highs, "low": lows}
-
-
-def get_scalp_data(pair):
     try:
-        symbol = PAIRS[pair]["symbol"]
-        print(f"Fetching {symbol}")
-
-        s5  = fetch_series(symbol, "5min")
-        s15 = fetch_series(symbol, "15min")
-
-        if not s5 or len(s5["close"]) < 20:
-            print(f"5m data empty for {symbol}")
-            return None
-        if not s15 or len(s15["close"]) < 20:
-            print(f"15m data empty for {symbol}")
-            return None
-
-        price = round(s5["close"][-1], 5)
-
-        # 5M indicators
-        rsi5 = rsi(s5["close"])
-        ema9_5  = ema(s5["close"][-30:], 9)
-        ema21_5 = ema(s5["close"][-30:], 21)
-        low14_5  = min(s5["low"][-14:])
-        high14_5 = max(s5["high"][-14:])
-        stoch5 = round(100 * (price - low14_5) / (high14_5 - low14_5), 1) if (high14_5 - low14_5) != 0 else 50.0
-        ema12_5 = ema(s5["close"], 12)
-        ema26_5 = ema(s5["close"], 26)
-        macd5 = ema12_5 - ema26_5
-        macd_cross5 = "🟢 صاعد" if macd5 > 0 else "🔴 هابط"
-
-        # 15M indicators
-        rsi15 = rsi(s15["close"])
-        ema9_15  = ema(s15["close"][-30:], 9)
-        ema21_15 = ema(s15["close"][-30:], 21)
-        low14_15  = min(s15["low"][-14:])
-        high14_15 = max(s15["high"][-14:])
-        stoch15 = round(100 * (price - low14_15) / (high14_15 - low14_15), 1) if (high14_15 - low14_15) != 0 else 50.0
-
-        # S/R from last 20 of 15M
-        res = round(max(s15["high"][-20:]), 5)
-        sup = round(min(s15["low"][-20:]), 5)
-        mid = round((res + sup) / 2, 5)
-
-        tp_pct = SCALP[pair]["tp"]
-        sl_pct = SCALP[pair]["sl"]
-
-        buy_score  = sum([rsi5 < 35, rsi15 < 40, stoch5 < 25, price > ema9_15, macd5 > 0])
-        sell_score = sum([rsi5 > 65, rsi15 > 60, stoch5 > 75, price < ema9_15, macd5 < 0])
-
-        if buy_score >= 3:
-            sig = "🟢 شراء سكالبينج"; entry = price
-            tp = round(price * (1 + tp_pct), 5); sl = round(price * (1 - sl_pct), 5)
-            strength = "⭐" * buy_score
-        elif sell_score >= 3:
-            sig = "🔴 بيع سكالبينج"; entry = price
-            tp = round(price * (1 - tp_pct), 5); sl = round(price * (1 + sl_pct), 5)
-            strength = "⭐" * sell_score
-        else:
-            sig = "⏸️ انتظار إشارة"; entry = None; tp = None; sl = None; strength = ""
-
-        trend5  = "🔼 صاعد" if ema9_5  > ema21_5  else "🔽 هابط"
-        trend15 = "🔼 صاعد" if ema9_15 > ema21_15 else "🔽 هابط"
-
-        return {
-            "price": price, "rsi5": rsi5, "rsi15": rsi15,
-            "stoch5": stoch5, "stoch15": stoch15, "macd_cross5": macd_cross5,
-            "trend5": trend5, "trend15": trend15,
-            "res": res, "sup": sup, "mid": mid,
-            "sig": sig, "entry": entry, "tp": tp, "sl": sl, "strength": strength
-        }
-
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
     except Exception as e:
-        print(f"Error fetching {pair}: {e}")
+        log.error(f"[API] خطأ في جلب {symbol} ({interval}): {e}")
+        return []
+
+    if data.get("status") == "error":
+        log.warning(f"[API] {symbol} ({interval}): {data.get('message', 'unknown error')}")
+        return []
+
+    values = data.get("values", [])
+    candles = []
+    for v in values:
+        try:
+            candles.append({
+                "time":   v["datetime"],
+                "open":   float(v["open"]),
+                "high":   float(v["high"]),
+                "low":    float(v["low"]),
+                "close":  float(v["close"]),
+                "volume": float(v.get("volume", 0)),
+            })
+        except Exception:
+            continue
+    return candles
+
+
+def fetch_price(symbol: str) -> float | None:
+    """جلب السعر الحالي من Twelve Data"""
+    url = f"{TWELVE_BASE}/price"
+    params = {"symbol": symbol, "apikey": TWELVE_KEY}
+    try:
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        return float(data["price"])
+    except Exception as e:
+        log.error(f"[API] خطأ في جلب سعر {symbol}: {e}")
         return None
 
 
-def main_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌍 مسح الكل", callback_data="ALL")],
-        [InlineKeyboardButton("🥇 GOLD",      callback_data="GOLD"),
-         InlineKeyboardButton("🥈 SILVER",    callback_data="SILVER")],
-        [InlineKeyboardButton("📊 NASDAQ",    callback_data="NASDAQ"),
-         InlineKeyboardButton("📈 US30",      callback_data="DOW_JONES")],
-        [InlineKeyboardButton("🇪🇺 EUR/USD",  callback_data="EURUSD"),
-         InlineKeyboardButton("🇯🇵 USD/JPY",  callback_data="USDJPY")],
-        [InlineKeyboardButton("🇬🇧 GBP/USD",  callback_data="GBPUSD"),
-         InlineKeyboardButton("₿ BITCOIN",    callback_data="BITCOIN")],
-        [InlineKeyboardButton("🛢️ OIL",       callback_data="OIL")]
-    ])
+# ─────────────────────────────────────────────
+# حسابات المؤشرات الفنية
+# ─────────────────────────────────────────────
 
-def back_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔙 رجوع للقائمة", callback_data="back")]
-    ])
+def calc_ema(closes: list[float], period: int) -> list[float | None]:
+    """حساب EMA — يُعيد قائمة بنفس طول المدخلات (None للعناصر قبل period)"""
+    if len(closes) < period:
+        return [None] * len(closes)
+    k       = 2 / (period + 1)
+    ema     = [None] * (period - 1)
+    ema_val = sum(closes[:period]) / period
+    ema.append(ema_val)
+    for price in closes[period:]:
+        ema_val = price * k + ema_val * (1 - k)
+        ema.append(ema_val)
+    return ema
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "⚡ بوت سكالبينج الاحترافي\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "📊 تحليل على فريم 5M و 15M فقط\n"
-        "🎯 إشارات دخول وخروج سريعة\n"
-        "━━━━━━━━━━━━━━━━\n"
-        "اختر الزوج 👇",
-        reply_markup=main_keyboard()
+def calc_atr(candles: list[dict], period: int = 14) -> float:
+    """حساب ATR (متوسط المدى الحقيقي)"""
+    if len(candles) < period + 1:
+        return 0.0
+    true_ranges = []
+    for i in range(1, len(candles)):
+        h  = candles[i]["high"]
+        l  = candles[i]["low"]
+        pc = candles[i - 1]["close"]
+        true_ranges.append(max(h - l, abs(h - pc), abs(l - pc)))
+    if not true_ranges:
+        return 0.0
+    atr = sum(true_ranges[:period]) / period
+    for tr in true_ranges[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+# ─────────────────────────────────────────────
+# منطق SMC: Order Blocks & FVG
+# ─────────────────────────────────────────────
+
+def detect_order_blocks(candles: list[dict], lookback: int = 30) -> dict:
+    """
+    كشف Order Blocks على فريم 15 دقيقة.
+    OB صاعد : آخر شمعة هابطة قبل حركة صعودية قوية (شمعتان خضراوتان بعدها).
+    OB هابط : آخر شمعة صاعدة قبل حركة هبوطية قوية (شمعتان حمراوتان بعدها).
+    """
+    bullish_obs, bearish_obs = [], []
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+
+    for i in range(1, len(recent) - 2):
+        c0 = recent[i]
+        c1 = recent[i + 1]
+        c2 = recent[i + 2]
+        body0 = abs(c0["close"] - c0["open"])
+        move1 = abs(c1["close"] - c1["open"])
+
+        # OB صاعد
+        if (c0["close"] < c0["open"] and
+                c1["close"] > c1["open"] and
+                c2["close"] > c2["open"] and
+                move1 > body0 * 0.5):
+            bullish_obs.append((c0["high"], c0["low"]))
+
+        # OB هابط
+        if (c0["close"] > c0["open"] and
+                c1["close"] < c1["open"] and
+                c2["close"] < c2["open"] and
+                move1 > body0 * 0.5):
+            bearish_obs.append((c0["high"], c0["low"]))
+
+    return {"bullish": bullish_obs[-3:], "bearish": bearish_obs[-3:]}
+
+
+def detect_fvg(candles: list[dict], lookback: int = 40) -> dict:
+    """
+    كشف Fair Value Gaps (FVG).
+    FVG صاعد : low[i+2] > high[i]  → فجوة فوق
+    FVG هابط : high[i+2] < low[i]  → فجوة تحت
+    """
+    bullish_fvg, bearish_fvg = [], []
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+
+    for i in range(len(recent) - 2):
+        c0 = recent[i]
+        c2 = recent[i + 2]
+        if c2["low"] > c0["high"]:
+            bullish_fvg.append((c2["low"], c0["high"]))   # (top, bottom)
+        if c2["high"] < c0["low"]:
+            bearish_fvg.append((c0["low"], c2["high"]))
+
+    return {"bullish": bullish_fvg[-3:], "bearish": bearish_fvg[-3:]}
+
+
+def price_in_zone(price: float, zones: list[tuple]) -> bool:
+    """هل السعر داخل إحدى المناطق؟"""
+    return any(bottom <= price <= top for top, bottom in zones)
+
+
+# ─────────────────────────────────────────────
+# منطق SMC: Liquidity Sweep & CHoCH
+# ─────────────────────────────────────────────
+
+def detect_liquidity_sweep(candles_5m: list[dict], lookback: int = 20) -> dict:
+    """
+    صيد السيولة على فريم 5 دقائق.
+    صيد هابط (→ BUY): السعر يخترق أدنى نقطة سابقة ثم يُغلق فوقها.
+    صيد صاعد (→ SELL): السعر يخترق أعلى نقطة سابقة ثم يُغلق دونها.
+    """
+    if len(candles_5m) < lookback + 3:
+        return {"bullish_sweep": False, "bearish_sweep": False}
+
+    window = candles_5m[-(lookback + 3):-3]
+    last3  = candles_5m[-3:]
+
+    prev_high = max(c["high"] for c in window)
+    prev_low  = min(c["low"]  for c in window)
+
+    bullish_sweep = (
+        any(c["low"] < prev_low for c in last3) and
+        last3[-1]["close"] > prev_low
     )
-
-
-async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-
-    if q.data == "back":
-        await q.edit_message_text(
-            "⚡ بوت سكالبينج الاحترافي\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "📊 تحليل على فريم 5M و 15M فقط\n"
-            "🎯 إشارات دخول وخروج سريعة\n"
-            "━━━━━━━━━━━━━━━━\n"
-            "اختر الزوج 👇",
-            reply_markup=main_keyboard()
-        )
-        return
-
-    if q.data == "ALL":
-        await q.edit_message_text("⏳ جاري مسح الأسواق...", reply_markup=None)
-        msg = "⚡ مسح سكالبينج - جميع الأزواج\n━━━━━━━━━━━━━━━━━━━━\n"
-        for key in PAIRS:
-            d = get_scalp_data(key)
-            if d:
-                icon = "🟢" if "شراء" in d['sig'] else ("🔴" if "بيع" in d['sig'] else "⏸️")
-                msg += f"{icon} {PAIRS[key]['name']}: {d['price']}  |  {d['sig']}\n"
-            else:
-                msg += f"❌ {PAIRS[key]['name']}: خطأ\n"
-        await q.edit_message_text(msg, reply_markup=back_keyboard())
-        return
-
-    await q.edit_message_text("⏳ جاري التحليل...", reply_markup=None)
-    d = get_scalp_data(q.data)
-    if not d:
-        await q.edit_message_text(
-            "❌ خطأ في جلب البيانات\n"
-            "السوق مغلق أو البيانات غير متاحة\n"
-            "حاول مرة أخرى بعد قليل",
-            reply_markup=back_keyboard()
-        )
-        return
-
-    name = PAIRS[q.data]['name']
-    msg = (
-        f"{'━'*22}\n⚡ {name}  —  سكالبينج\n{'━'*22}\n\n"
-        f"💰 السعر الحالي : {d['price']}\n\n"
-        f"📊 فريم 5 دقائق:\n"
-        f"  RSI    : {d['rsi5']}\n"
-        f"  Stoch  : {d['stoch5']}\n"
-        f"  MACD   : {d['macd_cross5']}\n"
-        f"  الاتجاه: {d['trend5']}\n\n"
-        f"📊 فريم 15 دقيقة:\n"
-        f"  RSI    : {d['rsi15']}\n"
-        f"  Stoch  : {d['stoch15']}\n"
-        f"  الاتجاه: {d['trend15']}\n\n"
-        f"{'━'*22}\n"
-        f"📌 المستويات:\n"
-        f"  🔴 مقاومة : {d['res']}\n"
-        f"  ⚪ وسط    : {d['mid']}\n"
-        f"  🟢 دعم    : {d['sup']}\n\n"
-        f"{'━'*22}\n"
-        f"🎯 الإشارة: {d['sig']}  {d['strength']}\n"
+    bearish_sweep = (
+        any(c["high"] > prev_high for c in last3) and
+        last3[-1]["close"] < prev_high
     )
-    if d['entry']:
-        rr = round(abs(d['tp'] - d['entry']) / abs(d['sl'] - d['entry']), 2) if d['sl'] != d['entry'] else 0
-        msg += (
-            f"\n💵 الدخول       : {d['entry']}"
-            f"\n🎯 الهدف        : {d['tp']}"
-            f"\n🛑 وقف الخسارة : {d['sl']}"
-            f"\n⚖️ RR           : 1:{rr}"
-        )
-    else:
-        msg += "\n⚠️ انتظر تأكيداً أقوى للدخول"
-    msg += f"\n{'━'*22}"
-
-    await q.edit_message_text(msg, reply_markup=back_keyboard())
+    return {"bullish_sweep": bullish_sweep, "bearish_sweep": bearish_sweep}
 
 
-app = Application.builder().token(TOKEN).build()
-app.add_handler(CommandHandler("start", start))
-app.add_handler(CallbackQueryHandler(button))
-print("⚡ Scalping Bot is running!")
-app.run_polling(drop_pending_updates=True)
+def detect_choch(candles_1m: list[dict], direction: str) -> bool:
+    """
+    كسر هيكل السعر CHoCH على فريم 1 دقيقة.
+    buy  → آخر شمعة تُغلق فوق أعلى نقطة في الـ 5 شمعات السابقة.
+    sell → آخر شمعة تُغلق تحت أدنى نقطة في الـ 5 شمعات السابقة.
+    """
+    if len(candles_1m) < 10:
+        return 
