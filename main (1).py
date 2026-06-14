@@ -124,7 +124,7 @@ class GoldSilverMonitorBot:
             
             # ===== 4. جلب بيانات الشمعة السابقة وحساب الارتكاز =====
             self.logger.info("جلب بيانات الشمعة السابقة للذهب...")
-            gold_candle = self.mt5_connector.get_last_candle_data("XAUUSD")
+            gold_candle = self.mt5_connector.get_last_candle_data("XAUUSD.x")
             
             if gold_candle:
                 self.logger.info("✅ تم جلب بيانات شمعة الذهب:")
@@ -159,7 +159,7 @@ class GoldSilverMonitorBot:
             
             # جلب بيانات الفضة أيضًا
             self.logger.info("جلب بيانات الشمعة السابقة للفضة...")
-            silver_candle = self.mt5_connector.get_last_candle_data("XAGUSD")
+            silver_candle = self.mt5_connector.get_last_candle_data("XAGUSD.x")
             
             if silver_candle:
                 self.logger.info("✅ تم جلب بيانات شمعة الفضة")
